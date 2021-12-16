@@ -1,0 +1,838 @@
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
+
+public class Disassemble {
+    static class Symbol {
+        int st_name;
+        int st_value;
+        int st_size;
+        int st_info;
+        int st_other;
+        int st_shndx;
+        String name = "";
+    }
+
+    static ArrayList<Symbol> symbols = new ArrayList<>();
+    static int jumpAddr;
+    static int shNum;
+    static int shSize;
+    static int shAddr;
+    static int symTabSize;
+    static int symTabAddr;
+    static int shStrInd;
+    static int shStrAddr;
+    static int symStrAddr;
+    static int textAddr;
+    static int textSize;
+    static int textVirtAddr;
+    static int labelCnt = 0;
+    static int[] contents;
+
+    //Finding sections
+    static void findSections() {
+        int currPos = shAddr;
+        for (int i = 0; i < shNum; i++, currPos += shSize) {
+            int currStrAddr = 0;
+            for (int j = 0; j < 4; j++) {
+                currStrAddr += (contents[currPos+j] << (8*j));
+            }
+
+            String name = getName(currStrAddr, shStrAddr);
+            if (name.equals(".symtab")) {
+                for (int j = 0; j < 4; j++) {
+                    symTabAddr += (contents[currPos+16+j] <<(8*j));
+                }
+                for (int j = 0; j < 4; j++) {
+                    symTabSize += (contents[currPos+20+j] <<(8*j));
+                }
+            } else if (name.equals(".strtab")) {
+                for (int j = 0; j < 4; j++) {
+                    symStrAddr += (contents[currPos+16+j] <<(8*j));
+                }
+            } else if (name.equals(".text")) {
+                for (int j = 0; j < 4; j++) {
+                    textAddr += (contents[currPos+16+j] <<(8*j));
+                }
+                for (int j = 0; j < 4; j++) {
+                    textSize += (contents[currPos+20+j] <<(8*j));
+                }
+                for (int j = 0; j < 4; j++) {
+                    textVirtAddr += (contents[currPos+12+j] <<(8*j));
+                }
+            }
+
+        }
+    }
+
+    //Symtab interactions
+    static void fillSymbols(Map<Integer, String> symByAddr) {
+        for (int currPos = symTabAddr; currPos < symTabSize + symTabAddr; currPos += 16) {
+            Symbol curr = new Symbol();
+            for (int j = 0; j < 4; j++) {
+                curr.st_name += (contents[currPos+j] << (8*j));
+                curr.st_value += (contents[currPos+j+4] << (8*j));
+                curr.st_size += (contents[currPos+j+8] << (8*j));
+            }
+            curr.st_info = contents[currPos+12];
+            curr.st_other = contents[currPos+13];
+            curr.st_shndx = contents[currPos+14] + (contents[currPos+15] << 8);
+            curr.name = getName(curr.st_name, symStrAddr);
+            symbols.add(curr);
+            symByAddr.put(curr.st_value, curr.name);
+        }
+    }
+
+    static String getName(int namePos, int strTabAddr) {
+        StringBuilder name = new StringBuilder();
+
+        namePos += strTabAddr;
+        while (contents[namePos] != 0) {
+            name.append(Character.toString(contents[namePos++]));
+        }
+
+        return name.toString();
+    }
+
+    //SymbolConversions
+    static String bindingToString(int binding) {
+        switch (binding) {
+            case 0:
+                return "LOCAL";
+            case 1:
+                return "GLOBAL";
+            case 2:
+                return "WEAK";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    static String visibilityToString(int visibility) {
+        switch (visibility) {
+            case 0:
+                return "DEFAULT";
+            case 1:
+                return "INTERNAL";
+            case 2:
+                return "HIDDEN";
+            case 3:
+                return "PROTECTED";
+            case 4:
+                return "EXPORTED";
+            case 5:
+                return "SINGLETON";
+            case 6:
+                return "ELIMINATE";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    static String typeToString(int type) {
+        switch (type) {
+            case 0:
+                return "NOTYPE";
+            case 1:
+                return "OBJECT";
+            case 2:
+                return "FUNC";
+            case 3:
+                return "SECTION";
+            case 4:
+                return "FILE";
+            case 5:
+                return "COMMON";
+            case 6:
+                return "TLS";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    static String shindexToString(int shindex) {
+        switch (shindex) {
+            case 0:
+                return "UNDEF";
+            case 0xfff1:
+                return "ABS";
+            case 0xfff2:
+                return "COMMON";
+            case 0xffff:
+                return "XINDEX";
+            default:
+                return String.valueOf(shindex);
+        }
+    }
+
+    //SignExtension
+    static int signExtend(int num, int len) {
+        if (((num>>(len-1)) & 1) == 1) {
+            num = -((-num) & ((1<<len) - 1));
+        }
+
+        return num;
+    }
+
+    //Offsets and Immidiates
+    static int getJalOffset(int imm) {
+        int res = (imm>>9) & ((1<<10) - 1);
+        res += (1<<10) * ((imm>>8)&1);
+        res += (1<<11) * (imm & ((1<<8)-1));
+        res += (imm>>19) * (1<<19);
+
+        return res;
+    }
+
+    static int getBtypeOffset(int imm) {
+        int res = (imm>>1) & ((1<<4)-1);
+        res += ((imm>>5) & ((1<<6)-1)) * (1<<4);
+        res += (imm & 1) * (1<<10);
+        res += (imm>>11) * (1<<11);
+
+        return signExtend(res*2, 13);
+    }
+
+    static int getAdd4spnImm (int instruction) {
+        int res = (instruction >> 6) & 1;
+        res += ((instruction >> 5) & 1) * 2;
+        res += ((instruction >> 10) & 3) * 4;
+        res += ((instruction >> 7) & 7) * 16;
+        res *= 4;
+
+        return res;
+    }
+
+    static int getClwImm(int instruction) {
+        int res = (instruction >> 6) & 1;
+        res += ((instruction >> 10) & 7) * 2;
+        res += ((instruction >> 5) & 1) * 16;
+        return res * 4;
+    }
+
+    static int getAddiImm(int instruction) {
+        int res = (instruction >> 2) & 31;
+        res += (instruction >> 12) * 32;
+
+        return res;
+    }
+
+    static int getCjalImm(int instruction) {
+        int res = (instruction >> 3) & 7;
+        res += ((instruction >> 11) & 1) * 8;
+        res += ((instruction >> 2) & 1) * 16;
+        res += ((instruction >> 7) & 1) * 32;
+        res += ((instruction >> 6) & 1) * 64;
+        res += ((instruction >> 9) & 3) * 128;
+        res += ((instruction >> 8) & 1) * 512;
+        res += ((instruction >> 12) & 1) * 1024;
+
+        return res*2;
+    }
+
+    static int getCluiImm(int instruction) {
+        int res = ((instruction >> 2) & 31);
+        res += ((instruction >> 12) & 1) * 32;
+
+        return res * (1<<12);
+    }
+
+    static int getCliImm(int instruction) {
+        int res = ((instruction >> 2) & 31);
+        res += ((instruction >> 12) & 1) * 32;
+
+        return res;
+    }
+
+    static int getCbImm(int instruction) {
+        int res = ((instruction >> 3) & 3);
+        res += ((instruction >> 10) & 3) * 4;
+        res += ((instruction >> 2) & 1) * 16;
+        res += ((instruction >> 5) & 3) * 32;
+        res += ((instruction >> 12) & 1) * 128;
+
+        return res*2;
+    }
+
+    static int getClwspImm(int instruction) {
+        int res = ((instruction >> 4) & 7);
+        res += ((instruction >> 12) & 1) * 8;
+        res += ((instruction >> 2) & 3) * 16;
+
+        return res * 4;
+    }
+
+    static int getCswspImm(int instruction) {
+        int res = ((instruction >> 9) & 15);
+        res += ((instruction >> 7) & 3) * 16;
+
+        return res * 4;
+    }
+
+    static int getAddi16spImm(int instruction) {
+        int res = ((instruction >> 6) & 1);
+        res += ((instruction >> 2) & 1) * 2;
+        res += ((instruction >> 5) & 1) * 4;
+        res += ((instruction >> 3) & 3) * 8;
+        res += ((instruction >> 12) & 1) * 64;
+
+        return res * 16;
+    }
+
+    static String dealWithRVC(int instruction, int currPos, Map<Integer, String> symByAddr) {
+        int lastOp = instruction >> 13;
+        int firstOp = instruction & 3;
+        int centralImm = (instruction >> 5) & ((1<<8)-1);
+        int rd = (instruction>>2) & (7);
+
+        if (instruction == 0) {
+            return "illegal instruction";
+        }
+        if (firstOp == 0b00) {
+            int rs1 = (instruction >> 7) & 7;
+            int rs2 = (instruction >> 2) & 7;
+            if (lastOp == 0b000 && centralImm > 0) { //c.addi4spn
+                return String.format("%s %s, %s, %s", "c.addi4spn", getRvcABI(rd), "sp",
+                        getAdd4spnImm(instruction));
+            }
+            if (lastOp == 0b010) { //c.lw
+                return String.format("%s %s, %s(%s)", "c.lw", getRvcABI(rd),
+                        getClwImm(instruction), getRvcABI(rs1));
+            }
+            if (lastOp == 0b110) { //c.sw
+                return String.format("%s %s, %s(%s)", "c.sw", getRvcABI(rs2), getClwImm(instruction), getRvcABI(rs1));
+            }
+        }  else if (firstOp == 0b01) {
+            int rd1 = (instruction >> 7) & 31;
+            int cenOp = (instruction >> 10) & 3;
+            int rd2 = (instruction >> 7) & 7;
+            if (lastOp == 0b000) {
+                if (rd1 == 0) { //c.nop
+                    return "c.nop";
+                } else { //c.addi
+                    return String.format("%s %s, %s", "c.addi", getABI(rd1),
+                            signExtend(getAddiImm(instruction), 6));
+                }
+            }
+            if (lastOp == 0b001) { //c.jal
+                currPos += signExtend(getCjalImm(instruction), 12);
+                return String.format("%s %s", "c.jal", symByAddr.get(currPos));
+            }
+            if (lastOp == 0b010) { //c.li
+                return String.format("%s %s, %s", "c.li", getABI(rd1), signExtend(getCliImm(instruction), 6));
+            }
+            if (lastOp == 0b011 ) {
+                if (rd1 != 0 && rd1 != 2) { //c.lui
+                    return String.format("%s %s, %s", "c.lui", getABI(rd1), signExtend(getCluiImm(instruction), 18));
+                } else { //c.addi16sp
+                    return String.format("%s %s, %s, %s", "c.addi16sp", "sp", "sp",
+                            signExtend(getAddi16spImm(instruction), 10));
+                }
+            }
+            if (lastOp == 0b100) {
+                if (cenOp == 0b00) { //c.srli
+                    return String.format("%s %s, %s", "c.srli", getRvcABI(rd2), getCliImm(instruction));
+                }
+                if (cenOp == 0b01) { //c.srai
+                    return String.format("%s %s, %s", "c.srai", getRvcABI(rd2), getCliImm(instruction));
+                }
+                if (cenOp == 0b10) { //c.andi
+                    return String.format("%s %s, %s", "c.andi", getRvcABI(rd2), signExtend(getCliImm(instruction), 6));
+                }
+                if (cenOp == 0b11) {
+                    int rs2 = (instruction >> 2) & 7;
+                    int lowerOp = (instruction >> 5) & 3;
+                    if (lowerOp == 0b00) { //c.sub
+                        return String.format("%s %s, %s", "c.sub", getRvcABI(rd2), getRvcABI(rs2));
+                    }
+                    if (lowerOp == 0b01) { //c.xor
+                        return String.format("%s %s, %s", "c.xor", getRvcABI(rd2), getRvcABI(rs2));
+                    }
+                    if (lowerOp == 0b10) { //c.or
+                        return String.format("%s %s, %s", "c.or", getRvcABI(rd2), getRvcABI(rs2));
+                    }
+                    if (lowerOp == 0b11) { //c.and
+                        return String.format("%s %s, %s", "c.and", getRvcABI(rd2), getRvcABI(rs2));
+                    }
+                }
+            }
+            if (lastOp == 0b101) { //c.j
+                return String.format("%s %s", "c.j",
+                        symByAddr.get(currPos + signExtend(getCjalImm(instruction), 12)));
+            }
+            if (lastOp == 0b110) { //c.beqz
+                currPos += signExtend(getCbImm(instruction), 9);
+                return String.format("%s %s, %s", "c.beqz", getRvcABI(rd2), symByAddr.get(currPos));
+            }
+            if (lastOp == 0b111) { //c.bnez
+                currPos += signExtend(getCbImm(instruction), 9);
+                return String.format("%s %s, %s", "c.bnez", getRvcABI(rd2), symByAddr.get(currPos));
+            }
+        } else if (firstOp == 0b10) {
+            int rd1 = (instruction >> 7) & 31;
+            int rs2 = (instruction >> 2) & 31;
+            if (lastOp == 0b000) { //c.slli
+                return String.format("%s %s, %s", "c.slli", getABI(rd1), getCliImm(instruction));
+            }
+            if (lastOp == 0b010) { //c.lwsp
+                return String.format("%s %s, %s(sp)", "c.lwsp", getABI(rd1), getClwspImm(instruction));
+            }
+            if (lastOp == 0b100) {
+                int detBit = (instruction >> 12) & 1;
+                if (detBit == 0) {
+                    if (rs2 == 0) { //c.jr
+                        return String.format("%s %s", "c.jr", getABI(rd1));
+                    } else { //c.mv
+                        return String.format("%s %s, %s", "c.mv", getABI(rd1), getABI(rs2));
+                    }
+                }
+                if (detBit == 1) {
+                    if (rd1 == 0 && rs2 == 0) { //c.ebreak
+                        return "c.ebreak";
+                    }
+                    if (rd1 != 0 && rs2 == 0) { //c.jalr
+                        return String.format("%s %s", "c.jalr", getABI(rd1));
+                    }
+                    return String.format("%s %s, %s", "c.add", getABI(rd1), getABI(rs2)); //c.add
+                }
+            }
+            if (lastOp == 0b110) { //c.swsp
+                return String.format("%s %s, %s(sp)", "c.swsp", getABI(rs2), getCswspImm(instruction));
+            }
+        }
+        return "unknown_command";
+    }
+
+    public static void main(String[] args) {
+        Map<Integer, String> symByAddr = new HashMap<>();
+        try {
+            byte[] inp = Files.readAllBytes(Paths.get(args[0]));
+            contents = new int[inp.length];
+            for (int i = 0; i < inp.length; i++) {
+                if (inp[i] < 0) {
+                    contents[i] = inp[i] + 256;
+                } else {
+                    contents[i] = inp[i];
+                }
+            }
+
+            int[] elfCheck = new int[]{0x7f, 0x45, 0x4c, 0x46};
+            for (int i = 0; i < 4; i++) {
+                if (contents[i] != elfCheck[i]) {
+                    throw new InputMismatchException("Not an elf file");
+                }
+            }
+            if (contents[4] == 2 || contents[5] == 2 || contents[6] != 1) {
+                throw new InputMismatchException("Unsupported elf file type");
+            }
+            shNum = contents[48] + (contents[49] << 8);
+            shSize = contents[46] + (contents[47] << 8);
+            shStrInd = contents[50] + (contents[51] << 8);
+            for (int i  = 0; i < 4; i++) {
+                shAddr += (contents[32+i] << (8*i));
+            }
+            if (shSize != 40) {
+                throw new InputMismatchException("Wrong SectionHeader size");
+            }
+
+            for (int i = 0; i < 4; i++) {
+                shStrAddr += (contents[shAddr+shSize*shStrInd+16+i] << (8*i));
+            }
+
+            findSections();
+
+            fillSymbols(symByAddr);
+
+            getLocalLabels(symByAddr);
+        } catch (FileNotFoundException e) {
+            System.out.println("File not found " + e.getMessage());
+        } catch (IOException e) {
+            System.out.println("File error " + e.getMessage());
+        }
+
+        try (BufferedWriter out = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(args[1])))) {
+            outText(out, symByAddr);
+            outSymTable(out);
+        } catch (IOException e) {
+            System.out.println("Cannot access output file " + e.getMessage());
+        }
+    }
+
+    //Searching for local labels
+    static void getLocalLabels(Map<Integer, String> symByAddr) {
+        for (int currPos = textAddr; currPos < textAddr + textSize; currPos += 2) {
+            jumpAddr = currPos + textVirtAddr - textAddr;
+            int currInstr = 0;
+            int instruction;
+            for (int i = 0; i < 2; i++) {
+                currInstr += (contents[currPos+i] <<(8*i));
+            }
+            if ((currInstr & 3) == 3) {
+                currPos += 2;
+                for (int i = 0; i < 2; i++) {
+                    currInstr += (contents[currPos+i] <<(8*(i+2)));
+                }
+                instruction = currInstr;
+                int opcode = instruction & ((1 << 8) - 1);
+                if (opcode == 0b1101111) { //jal
+                    jumpAddr += signExtend(getJalOffset(instruction >> 12), 20) * 2;
+                    String label = symByAddr.get(jumpAddr);
+                    if (label == null) {
+                        symByAddr.put(jumpAddr, String.format("LOC_%05x", labelCnt++));
+                    }
+                }
+                if (opcode == 0b1100011) { //b-type
+                    jumpAddr += getBtypeOffset(((instruction >> 7) % (1 << 5)) + ((instruction >> 25) << 5));
+                    String label = symByAddr.get(jumpAddr);
+                    if (label == null) {
+                        symByAddr.put(jumpAddr, String.format("LOC_%05x", labelCnt++));
+                    }
+                }
+            } else {
+                String label;
+                int lastOp1 = currInstr >> 13;
+                int begOp1 = currInstr & 3;
+
+                if (begOp1 == 0b01 && (lastOp1 == 0b001 || lastOp1 == 0b101)) { //jal or j
+                    jumpAddr += signExtend(getCjalImm(currInstr), 12);
+                    label = symByAddr.get(jumpAddr);
+                    if (label == null) {
+                        symByAddr.put(jumpAddr, String.format("LOC_%05x", labelCnt++));
+                    }
+                }
+                if (begOp1 == 0b01 && (lastOp1 == 0b110 || lastOp1 == 0b111)) { //b-type
+                    jumpAddr += signExtend(getCbImm(currInstr), 9);
+                    label = symByAddr.get(jumpAddr);
+                    if (label == null) {
+                        symByAddr.put(jumpAddr, String.format("LOC_%05x", labelCnt++));
+                    }
+                }
+            }
+        }
+    }
+
+    static void outText(BufferedWriter out, Map<Integer, String> symByAddr) throws IOException {
+        int currInstruction;
+        out.write(".text");
+        out.newLine();
+        for (int currPos = textAddr; currPos < textAddr + textSize; currPos += 2) {
+            currInstruction = 0;
+            for (int i = 0; i < 2; i++) {
+                currInstruction += (contents[currPos+i] <<(8*i));
+            }
+
+            int currAddr = textVirtAddr + currPos - textAddr;
+            out.write(String.format("%08x ", currAddr));
+
+            String label = symByAddr.get(currAddr);
+            if (label != null)  {
+                out.write(String.format("%10s: ", label));
+            } else {
+                out.write(String.format("%10s", ""));
+            }
+
+            if ((currInstruction & 3) != 3) {
+                out.write(dealWithRVC(currInstruction, currAddr, symByAddr));
+            } else {
+                currPos += 2;
+                for (int i = 0; i < 2; i++) {
+                    currInstruction += (contents[currPos+i] <<(8*(i+2)));
+                }
+                int instruction = currInstruction;
+
+                int rs1 = (instruction >> 15) & ((1 << 5)-1);
+                int rs2 = (instruction >> 20) & ((1 << 5)-1);
+                int rd = (instruction >> 7) & ((1 << 5)-1);
+                int funct3 = (instruction >> 12) & ((1 << 3)-1);
+                int opcode = instruction & ((1 << 7) - 1);
+                int funct7 = instruction >> 25;
+                int imm12 = instruction >> 20;
+                int imm20 = instruction >> 12;
+
+                switch (opcode) {
+                    case 0b0110111: //LUI
+                        out.write(String.format("%s %s, %s", "lui", getABI(rd), signExtend(imm20<<12, 32)));
+                        break;
+                    case 0b0010111: //AUIPC
+                        out.write(String.format("%s %s, %s", "auipc", getABI(rd), signExtend(imm20<<12, 32)));
+                        break;
+                    case 0b1101111: //JAL
+                        out.write(String.format("%s %s, %s", "jal",
+                                getABI(rd), symByAddr.get(currAddr + signExtend(getJalOffset(imm20), 20) * 2)));
+                        break;
+                    case 0b1100111: //JALR
+                        out.write(String.format("%s %s, %s(%s)", "jalr", getABI(rd), imm12, getABI(rs1)));
+                        break;
+                    case 0b1100011:
+                        switch (funct3) {
+                            case 0b000: //BEQ
+                                out.write(String.format("%s %s, %s, %s", "beq",
+                                        getABI(rs1), getABI(rs2),
+                                        symByAddr.get(currAddr + getBtypeOffset(rd + (funct7 << 5)))));
+                                break;
+                            case 0b001: //BNE
+                                out.write(String.format("%s %s, %s, %s", "bne",
+                                        getABI(rs1), getABI(rs2),
+                                        symByAddr.get(currAddr + getBtypeOffset(rd + (funct7 << 5)))));
+                                break;
+                            case 0b100: //BLT
+                                out.write(String.format("%s %s, %s, %s", "blt",
+                                        getABI(rs1), getABI(rs2),
+                                        symByAddr.get(currAddr + getBtypeOffset(rd + (funct7 << 5)))));
+                                break;
+                            case 0b101: //BGE
+                                out.write(String.format("%s %s, %s, %s", "bge",
+                                        getABI(rs1), getABI(rs2),
+                                        symByAddr.get(currAddr + getBtypeOffset(rd + (funct7 << 5)))));
+                                break;
+                            case 0b110: //BLTU
+                                out.write(String.format("%s %s, %s, %s", "bltu",
+                                        getABI(rs1), getABI(rs2),
+                                        symByAddr.get(currAddr + getBtypeOffset(rd + (funct7 << 5)))));
+                                break;
+                            case 0b111: //BGEU
+                                out.write(String.format("%s %s, %s, %s", "bgeu",
+                                        getABI(rs1), getABI(rs2),
+                                        symByAddr.get(currAddr + getBtypeOffset(rd + (funct7 << 5)))));
+                                break;
+                        }
+                        break;
+                    case 0b0000011:
+                        switch (funct3) {
+                            case 0b000: //LB
+                                out.write(String.format("%s %s, %s(%s)", "lb", getABI(rd),
+                                        signExtend(imm12, 12), getABI(rs1)));
+                                break;
+                            case 0b001: //LH
+                                out.write(String.format("%s %s, %s(%s)", "lh", getABI(rd),
+                                        signExtend(imm12, 12), getABI(rs1)));
+                                break;
+                            case 0b010: //LW
+                                out.write(String.format("%s %s, %s(%s)", "lw", getABI(rd),
+                                        signExtend(imm12, 12), getABI(rs1)));
+                                break;
+                            case 0b100: //LBU
+                                out.write(String.format("%s %s, %s(%s)", "lbu", getABI(rd),
+                                        signExtend(imm12, 12), getABI(rs1)));
+                                break;
+                            case 0b101: //LHU
+                                out.write(String.format("%s %s, %s(%s)", "lhu", getABI(rd),
+                                        signExtend(imm12, 12), getABI(rs1)));
+                                break;
+                        }
+                        break;
+                    case 0b0100011:
+                        switch (funct3) {
+                            case 0b000: //SB
+                                out.write(String.format("%s %s, %s(%s)", "sb",
+                                        getABI(rs2), rd + (funct7 << 5), getABI(rs1)));
+                                break;
+                            case 0b001: //SH
+                                out.write(String.format("%s %s, %s(%s)", "sh",
+                                        getABI(rs2), rd + (funct7 << 5), getABI(rs1)));
+                                break;
+                            case 0b010: //SW
+                                out.write(String.format("%s %s, %s(%s)", "sw",
+                                        getABI(rs2), rd + (funct7 << 5), getABI(rs1)));
+                                break;
+                        }
+                        break;
+                    case 0b0010011:
+                        switch (funct3) {
+                            case 0b000: //ADDI
+                                out.write(String.format("%s %s, %s, %s", "addi", getABI(rd),
+                                        getABI(rs1), signExtend(imm12, 12)));
+                                break;
+                            case 0b010: //SLTI
+                                out.write(String.format("%s %s, %s, %s", "slti", getABI(rd),
+                                        getABI(rs1), signExtend(imm12, 12)));
+                                break;
+                            case 0b011: //SLTIU
+                                out.write(String.format("%s %s, %s, %s", "sltiu", getABI(rd),
+                                        getABI(rs1), signExtend(imm12, 12)));
+                                break;
+                            case 0b100: //XORI
+                                out.write(String.format("%s %s, %s, %s", "xori", getABI(rd),
+                                        getABI(rs1), signExtend(imm12, 12)));
+                                break;
+                            case 0b110: //ORI
+                                out.write(String.format("%s %s, %s, %s", "ori", getABI(rd),
+                                        getABI(rs1), signExtend(imm12, 12)));
+                                break;
+                            case 0b111: //ANDI
+                                out.write(String.format("%s %s, %s, %s", "andi", getABI(rd),
+                                        getABI(rs1), signExtend(imm12, 12)));
+                                break;
+                            case 0b001: //SLLI
+                                out.write(String.format("%s %s, %s, %s", "slli", getABI(rd),
+                                        getABI(rs1), rs2));
+                                break;
+                            case 0b101:
+                                if (funct7 == 0b0000000) { //SRLI
+                                    out.write(String.format("%s %s, %s, %s", "srli", getABI(rd),
+                                            getABI(rs1), rs2));
+                                } else { //SRAI
+                                    out.write(String.format("%s %s, %s, %s", "srai", getABI(rd),
+                                            getABI(rs1), rs2));
+                                }
+                                break;
+                        }
+                        break;
+                    case 0b0110011:
+                        switch (funct3) {
+                            case 0b000:
+                                if (funct7 == 0b0000000) { //ADD
+                                    out.write(String.format("%s %s, %s, %s", "add", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else if (funct7 == 0b0100000) { //SUB
+                                    out.write(String.format("%s %s, %s, %s", "sub", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //MUL
+                                    out.write(String.format("%s %s, %s, %s", "mul", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b001:
+                                if (funct7 == 0b0000000) { //SLL
+                                    out.write(String.format("%s %s, %s, %s", "sll", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //MULH
+                                    out.write(String.format("%s %s, %s, %s", "mulh", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b010:
+                                if (funct7 == 0b0000000) { //SLT
+                                    out.write(String.format("%s %s, %s, %s", "slt", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //MULHSU
+                                    out.write(String.format("%s %s, %s, %s", "mulhsu", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b011:
+                                if (funct7 == 0b0000000) { //SLTU
+                                    out.write(String.format("%s %s, %s, %s", "sltu", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //MULHU
+                                    out.write(String.format("%s %s, %s, %s", "mulhu", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b100:
+                                if (funct7 == 0b0000000) { //XOR
+                                    out.write(String.format("%s %s, %s, %s", "xor", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //DIV
+                                    out.write(String.format("%s %s, %s, %s", "div", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b101:
+                                if (funct7 == 0b0000000) { //SRL
+                                    out.write(String.format("%s %s, %s, %s", "srl", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else if (funct7 == 0b0100000) { //SRA
+                                    out.write(String.format("%s %s, %s, %s", "sra", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //DIVU
+                                    out.write(String.format("%s %s, %s, %s", "divu", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b110:
+                                if (funct7 == 0b0000000) { //OR
+                                    out.write(String.format("%s %s, %s, %s", "or", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //REM
+                                    out.write(String.format("%s %s, %s, %s", "rem", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                            case 0b111:
+                                if (funct7 == 0b0000000) { //AND
+                                    out.write(String.format("%s %s, %s, %s", "and", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                } else { //REMU
+                                    out.write(String.format("%s %s, %s, %s", "remu", getABI(rd),
+                                            getABI(rs1), getABI(rs2)));
+                                }
+                                break;
+                        }
+                        break;
+                    case 0b1110011:
+                        switch (imm12) {
+                            case 0: //ECALL
+                                out.write("ecall");
+                                break;
+                            case 1: //EBREAK
+                                out.write("ebreak");
+                                break;
+                        }
+                        break;
+                    default:
+                        out.write("unknown_command");
+                }
+            }
+            out.newLine();
+        }
+        out.newLine();
+    }
+
+    static void outSymTable(BufferedWriter out) throws IOException {
+        out.write(".symtab");
+        out.newLine();
+        int symbolCount = symTabSize / 16;
+        out.write(String.format("%s %-15s %7s %-8s %-8s %-8s %6s %s\n",
+                "Symbol", "Value", "Size", "Type", "Bind", "Vis", "Index", "Name"));
+        out.newLine();
+        for (int i = 0; i < symbolCount; i++) {
+            Symbol symbol = symbols.get(i);
+            out.write(String.format("[%4d] 0x%-15X %5d %-8s %-8s %-8s %6s %s\n",
+                    i,
+                    symbol.st_value,
+                    symbol.st_size,
+                    typeToString(symbol.st_info%16),
+                    bindingToString(symbol.st_info >>> 4),
+                    visibilityToString(symbol.st_other),
+                    shindexToString(symbol.st_shndx),
+                    symbol.st_name == 0 ? "" : symbol.name
+            ));
+            out.newLine();
+        }
+    }
+
+    //ABI stuff
+    static String getRvcABI(int reg) {
+        return getABI(reg+8);
+    }
+
+    static String getABI(int reg) {
+        if (reg == 0) {
+            return "zero";
+        } else if (reg == 1) {
+            return "ra";
+        } else if (reg == 2) {
+            return "sp";
+        } else if (reg == 3) {
+            return "gp";
+        } else if (reg == 4) {
+            return "tp";
+        } else if (reg >= 5 && reg <= 7) {
+            return "t"+(reg-5);
+        } else if (reg == 8) {
+            return "s0";
+        } else if (reg == 9) {
+            return "s1";
+        } else if (reg >= 10 && reg <= 17) {
+            return "a"+(reg-10);
+        } else if (reg >= 18 && reg <= 27) {
+            return "s"+(reg-16);
+        } else if (reg >= 28 && reg <= 31) {
+            return "t"+(reg-25);
+        } else {
+            throw new AssertionError("No such register");
+        }
+    }
+}
